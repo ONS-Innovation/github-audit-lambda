@@ -22,7 +22,7 @@ Saves the repositories to a `repositories.json` file in an S3 bucket.
 1. Build the docker image
 
 ```bash
-docker build -t <image_name> app.py
+docker build -t <image_name> .
 ```
 
 2. Run the docker image
