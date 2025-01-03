@@ -10,9 +10,13 @@ __pycache__/
 .env
 
 # Terraform
-.terraform/
+
+*.terraform/*
 terraform.tfstate
 terraform.tfstate.backup
 *.tfvars
 *.tfbackend
-.terraform.lock.hcl
+.terraform.lock.hcl 
+*.tfstate
+*.hcl
+
