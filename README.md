@@ -5,11 +5,11 @@ This repository contains the investigation of the rewrite for the GitHub Audit L
 
 ### Current metrics
 
-| Metric | Value |
-| --- | --- |
-| Current processing time | 344.45 seconds (5.74 minutes) |
-| Current total repositories | 2187 |
-| Per repository | 0.157 seconds |
+| Metric | Value Locally | Value on AWS Lambda |
+| --- | --- | --- |
+| Current processing time | 344.45 seconds (5.74 minutes) | 421.70 seconds (7.03 minutes) |
+| Current total repositories | 2187 | 2187 |
+| Per repository | 0.157 seconds | 0.192 seconds |
 
 ### Explanation
 
