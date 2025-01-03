@@ -13,31 +13,53 @@ This repository contains the investigation of the rewrite for the GitHub Audit L
 
 ### Explanation
 
-Uses github graphql api to get the repositories.
-Uses github rest api threading to process the repositories in parallel with the github graphql api.
-Saves the repositories to a repositories.json file.
+Uses GitHub GraphQL API to get the repositories.
+Uses GitHub RESTful API to process the repositories in parallel.
+Saves the repositories to a `repositories.json` file in an S3 bucket.
 
-### How to run
+### How to build and run in docker
 
-1. Clone the repository
-2. Install the dependencies
-
-```bash
-make install
-```
-
-3. Import the environment variables
+1. Build the docker image
 
 ```bash
-export AWS_ACCESS_KEY_ID=<>
-export AWS_SECRET_ACCESS_KEY=<>
-export GITHUB_APP_CLIENT_ID=<>
-export AWS_SECRET_NAME=<>
+docker build -t <image_name> app.py
 ```
 
-4. Run the script
+2. Run the docker image
 
 ```bash
-make run
+docker run --platform linux/amd64 -p 9000:8080 \
+-e GITHUB_ORG=<ONSDigital/ONS-innovation> \
+-e GITHUB_APP_CLIENT_ID=<> \
+-e AWS_SECRET_NAME=<> \
+-e AWS_ACCESS_KEY_ID=<> \
+-e AWS_SECRET_ACCESS_KEY=<> \
+-e AWS_DEFAULT_REGION=<> \
+-e AWS_ACCOUNT_NAME=<> \
+-e AWS_S3_BUCKET_NAME=<sdp-dev-github-audit> \
+-e REPO_LIMIT=<> \
+-e THREAD_COUNT=<3> \
+<image_name>
 ```
 
+#### Optional environment variables
+
+Set `REPO_LIMIT` to 0 to fetch all repositories.
+
+Set `THREAD_COUNT` to the number of threads to use. Recommended to set to 3.
+
+### How to lint
+
+Linting runs `black`, `ruff` and `pylint`.
+
+1. Install the dependencies
+
+```bash
+make install-dev
+```
+
+2. Run the linting
+
+```bash
+make lint
+```
