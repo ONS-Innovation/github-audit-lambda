@@ -10,7 +10,6 @@ __pycache__/
 .env
 
 # Terraform
-
 .terraform/
 terraform.tfstate
 terraform.tfstate.backup
@@ -19,4 +18,3 @@ terraform.tfstate.backup
 .terraform.lock.hcl 
 *.tfstate
 *.hcl
-
