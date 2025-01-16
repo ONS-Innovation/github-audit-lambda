@@ -5,11 +5,14 @@ import json
 import datetime
 import threading
 import queue
+import requests.exceptions
 import logging
 import time
 import boto3
 from github_api_toolkit import github_graphql_interface, github_interface
 import github_api_toolkit
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 # Set up logging for Lambda environment
 logger = logging.getLogger()
@@ -56,6 +59,13 @@ def get_repository_security_settings(gh: github_interface, repo_name: str) -> di
     """
     Get security settings for a repository using REST API.
     Checks if features are enabled by attempting to list alerts.
+
+    Args:
+        gh: github_interface
+        repo_name: str
+
+    Returns:
+        dict: security settings
     """
     try:
         # Check if Dependabot is enabled
@@ -82,10 +92,90 @@ def get_repository_security_settings(gh: github_interface, repo_name: str) -> di
         return {"dependabot_disabled": True, "secret_scanning_disabled": True}
 
 
+def get_secret_scanning_alerts(gh: github_interface, repo_name: str) -> list:
+    """Get secret scanning alerts for a repository
+    
+    Args:
+        gh: github_interface
+        repo_name: str
+
+    Returns:
+        list: secret scanning alerts
+    """
+    alerts = []
+    try:
+        response = gh.get(f"/repos/{org}/{repo_name}/secret-scanning/alerts")
+        if response.ok:
+            for alert in response.json():
+                alerts.append(
+                    {
+                        "repo": repo_name,
+                        "created_at": alert["created_at"],
+                        "secret": alert["secret_type_display_name"],
+                        "link": alert["html_url"],
+                    }
+                )
+        elif response.status_code == 404:
+            # Repository doesn't have secret scanning enabled or is public
+            logger.debug(f"Secret scanning not available for {repo_name}")
+    except AttributeError:
+        # Non-fatal error, so we can continue
+        pass
+    except Exception as e:
+        logger.error(
+            f"{e.__class__.__name__}: Error getting secret scanning alerts for {repo_name}: {str(e)}"
+        )
+    return alerts
+
+
+def get_dependabot_alerts(gh: github_interface, repo_name: str) -> list:
+    """Get Dependabot alerts for a repository
+    
+    Args:
+        gh: github_interface
+        repo_name: str
+
+    Returns:
+        list: dependabot alerts
+    """
+    alerts = []
+    try:
+        response = gh.get(f"/repos/{org}/{repo_name}/dependabot/alerts")
+        if response.ok:
+            for alert in response.json():
+                alerts.append(
+                    {
+                        "repo": repo_name,
+                        "created_at": alert["created_at"],
+                        "severity": alert["security_advisory"]["severity"],
+                        "package": alert["security_advisory"]["package"]["name"],
+                        "description": alert["security_advisory"]["description"],
+                        "link": alert["html_url"],
+                    }
+                )
+    except Exception as e:
+        logger.error(f"Error getting Dependabot alerts for {repo_name}: {str(e)}")
+    return alerts
+
+
 def process_repository_security(gh: github_interface, repo_info: dict):
-    """Process security settings for a single repository"""
+    """Process security settings for a single repository
+    
+    Args:
+        gh: github_interface
+        repo_info: dict
+    
+    Returns:
+        None
+    """
     try:
         security_settings = get_repository_security_settings(gh, repo_info["name"])
+
+        # Get secret scanning alerts if enabled
+        if not security_settings["secret_scanning_disabled"]:
+            repo_info["secret_scanning_alerts"] = get_secret_scanning_alerts(
+                gh, repo_info["name"]
+            )
 
         with processing_lock:
             repo_info["checklist"].update(security_settings)
@@ -97,7 +187,14 @@ def process_repository_security(gh: github_interface, repo_info: dict):
 
 
 def security_worker(gh: github_interface):
-    """Worker function to process repositories from the queue"""
+    """Worker function to process repositories from the queue
+    
+    Args:
+        gh: github_interface
+    
+    Returns:
+        None
+    """
     thread_name = threading.current_thread().name
     repos_processed = 0
     logger.info(f"{thread_name}: Started security worker")
@@ -110,7 +207,6 @@ def security_worker(gh: github_interface):
                     f"{thread_name}: Shutting down after processing {repos_processed} repositories"
                 )
                 break
-
             process_repository_security(gh, repo_info)
             repos_processed += 1
 
@@ -132,11 +228,113 @@ def security_worker(gh: github_interface):
             logger.error(f"{thread_name}: Worker error: {str(e)}")
             continue
 
+def check_is_inactive(repo):
+    # Calculate if repo is inactive
+    try:
+        history_nodes = repo["defaultBranchRef"]["target"][
+            "history"
+        ]["nodes"]
+        last_activity = datetime.datetime.strptime(
+            history_nodes[0]["committedDate"], "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except (KeyError, IndexError, TypeError):
+        last_activity = datetime.datetime.strptime(
+            repo["pushedAt"], "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    is_inactive = (
+        datetime.datetime.now() - last_activity
+    ).days > 365
+
+    return is_inactive
+
+def has_unprotected_branches(repo):
+    # Check branch protection
+    unprotected_branches = False
+    for branch in repo["refs"]["nodes"]:
+        protection = branch.get("branchProtectionRule")
+        if not protection or not all(
+            [
+                protection.get("requiresStatusChecks"),
+                protection.get("requiresApprovingReviews"),
+                protection.get("dismissesStaleReviews"),
+            ]
+        ):
+            unprotected_branches = True
+            break
+    return unprotected_branches
+
+def check_unsigned_commits(repo):
+    # Check unsigned commits
+    unsigned_commits = any(
+        not commit.get("signature", {}).get("isValid")
+        for commit in history_nodes
+        if commit and commit.get("signature")
+    )
+    return unsigned_commits
+
+def get_all_file_paths(repo):
+    # Get all file paths for file checks
+    files = []
+    if repo.get("object") and repo["object"].get("entries"):
+        files = [entry["path"].lower() for entry in repo["object"]["entries"]]
+    return files
+
+def check_dependabot_alerts(repo):
+    # Process vulnerability alerts
+    dependabot_alerts = []
+    if repo.get("vulnerabilityAlerts") and repo[
+        "vulnerabilityAlerts"
+    ].get("nodes"):
+        for alert in repo["vulnerabilityAlerts"]["nodes"]:
+            if not alert.get(
+                "dismissedAt"
+            ):  # Only include active alerts
+                created_at = datetime.datetime.strptime(
+                    alert["createdAt"], "%Y-%m-%dT%H:%M:%SZ"
+                )
+                days_open = (
+                    datetime.datetime.now() - created_at
+                ).days
+
+                dependabot_alerts.append(
+                    {
+                        "repo": repo["name"],
+                        "created_at": alert["createdAt"],
+                        "dependency": alert[
+                            "securityVulnerability"
+                        ]["package"]["name"],
+                        "advisory": alert["securityVulnerability"][
+                            "advisory"
+                        ]["description"],
+                        "severity": alert["securityVulnerability"][
+                            "severity"
+                        ].lower(),
+                        "days_open": days_open,
+                        "link": f"https://github.com/{org}/{repo['name']}/security/dependabot/{len(dependabot_alerts) + 1}",
+                    }
+                )
+    return dependabot_alerts
+
+
+def check_missing_file(files, file_name):
+    # Check for missing file
+    return not any(file_name in f for f in files)
 
 def get_repository_data_graphql(
-    ql: github_graphql_interface, gh: github_interface, org: str, batch_size: int = 30
+    ql: github_graphql_interface, gh: github_interface, org: str, batch_size: int = 25
 ):
-    """Gets repository data using concurrent processing"""
+    """Gets repository data using concurrent processing
+    
+    Args:
+        ql: github_graphql_interface
+        gh: github_interface
+        org: str
+        batch_size: int
+
+    Returns:
+        list: processed repositories
+    """
     start_time = time.time()
     logger.info(f"Starting repository data collection for {org}")
 
@@ -165,6 +363,23 @@ def get_repository_data_graphql(
             createdAt
             pushedAt
             isArchived
+            hasVulnerabilityAlertsEnabled
+            
+            vulnerabilityAlerts(first: 100) {
+              nodes {
+                createdAt
+                dismissedAt
+                securityVulnerability {
+                  severity
+                  package {
+                    name
+                  }
+                  advisory {
+                    description
+                  }
+                }
+              }
+            }
             
             # For inactive check and unsigned commits
             defaultBranchRef {
@@ -226,9 +441,9 @@ def get_repository_data_graphql(
         worker = threading.Thread(
             target=security_worker, args=(gh,), name=f"thread-{i+1}"
         )
+        worker.daemon = True  # Make threads daemon so they don't block shutdown
         worker.start()
         workers.append(worker)
-        logger.info(f"Started thread-{i+1}")
 
     has_next_page = True
     cursor = None
@@ -241,171 +456,192 @@ def get_repository_data_graphql(
 
             variables = {"org": org, "limit": batch_size, "cursor": cursor}
 
-            # Get GraphQL data with retries
-            for attempt in range(3):
-                result = ql.make_ql_request(query, variables)
-                if not result.ok:
-                    logger.error(
-                        f"GraphQL query failed on attempt {attempt+1}. "
-                        f"Waiting 5 seconds before retrying: {result.status_code}"
-                    )
-                    time.sleep(2.5)
-                    continue
-                data = result.json()
-                if "errors" in data:
-                    logger.error(
-                        f"GraphQL query failed on attempt {attempt+1}: {data['errors']}"
-                    )
-                    if attempt < 2:
-                        time.sleep(2.5)
+            # Get GraphQL data with retries and exponential backoff
+            for attempt in range(5):  # Increased retry attempts
+                try:
+                    result = ql.make_ql_request(query, variables)
+                    if not result.ok:
+                        if result.status_code in [403, 429]:  # Rate limit exceeded
+                            wait_time = min(
+                                2**attempt, 32
+                            )  # Exponential backoff capped at 32 seconds
+                            logger.warning(
+                                f"Rate limit hit on attempt {attempt+1}. "
+                                f"Waiting {wait_time} seconds before retrying."
+                            )
+                            time.sleep(wait_time)
+                            continue
+                        logger.error(
+                            f"GraphQL query failed on attempt {attempt+1} with status {result.status_code}"
+                        )
+                        time.sleep(1)
                         continue
-                break
+
+                    data = result.json()
+                    if "errors" in data:
+                        logger.error(
+                            f"GraphQL query failed on attempt {attempt+1}: {data['errors']}"
+                        )
+                        if attempt < 4:  # Allow for one more retry
+                            time.sleep(1)
+                            continue
+                    break
+                except (
+                    requests.exceptions.RequestException,
+                    requests.exceptions.ConnectionError,
+                ) as e:
+                    if attempt == 4:  # Last attempt
+                        logger.error(f"Failed all retry attempts: {str(e)}")
+                        raise
+                    wait_time = min(2**attempt, 32)
+                    logger.warning(
+                        f"Request failed with {e.__class__.__name__}, retrying in {wait_time}s"
+                    )
+                    time.sleep(wait_time)
             else:
                 logger.error("All attempts to execute GraphQL query failed.")
+                continue  # Skip this batch but continue with next cursor
 
-            repos = data["data"]["organization"]["repositories"]["nodes"]
-            TOTAL_RETRIEVED += len(repos)
-            logger.info(
-                f"Retrieved: {len(repos)} | Total repositories: {TOTAL_RETRIEVED}"
-            )
+            # Process the successful response
+            try:
+                repos = data["data"]["organization"]["repositories"]["nodes"]
+                TOTAL_RETRIEVED += len(repos)
+                logger.info(
+                    f"Retrieved: {len(repos)} | Total repositories: {TOTAL_RETRIEVED}"
+                )
 
-            # Process basic repository data and queue for security processing
-            for repo in repos:
-                try:
-                    # Calculate if repo is inactive
+                # Update pagination before processing
+                has_next_page = data["data"]["organization"]["repositories"][
+                    "pageInfo"
+                ]["hasNextPage"]
+                cursor = data["data"]["organization"]["repositories"]["pageInfo"][
+                    "endCursor"
+                ]
+
+                # Process repositories
+                for repo in repos:
                     try:
-                        history_nodes = repo["defaultBranchRef"]["target"]["history"][
-                            "nodes"
-                        ]
-                        last_activity = datetime.datetime.strptime(
-                            history_nodes[0]["committedDate"], "%Y-%m-%dT%H:%M:%SZ"
+                        is_inactive = check_is_inactive(repo)
+
+                        has_unprotected_branches = unprotected_branches(repo)
+
+                        unsigned_commits = check_unsigned_commits(repo)
+
+                        files = get_all_file_paths(repo)
+
+                        dependabot_alerts = check_dependabot_alerts(repo)
+
+                        # File checks
+                        readme_missing = check_missing_file(files, "readme.md")
+                        license_missing = check_missing_file(files, "license.md")
+                        pirr_missing = check_missing_file(files, "pirr.md")
+                        gitignore_missing = check_missing_file(files, ".gitignore")
+                        
+                        codeowners_missing = not any(
+                            f in [".github/codeowners", "codeowners", "docs/codeowners"]
+                            for f in files
                         )
-                    except (KeyError, IndexError, TypeError):
-                        last_activity = datetime.datetime.strptime(
-                            repo["pushedAt"], "%Y-%m-%dT%H:%M:%SZ"
+                        # Check for external PRs
+                        pr_authors = [
+                            pr["author"]["login"]
+                            for pr in repo["pullRequests"]["nodes"]
+                            if pr["author"]
+                        ]
+                        external_pr = any(
+                            author != "dependabot[bot]" for author in pr_authors
                         )
 
-                    is_inactive = (datetime.datetime.now() - last_activity).days > 365
+                        repo_info = {
+                            "name": repo["name"],
+                            "type": repo["visibility"].lower(),
+                            "url": repo["url"],
+                            "created_at": repo["createdAt"],
+                            "dependabot_alerts": dependabot_alerts,
+                            "checklist": {
+                                "inactive": is_inactive,
+                                "unprotected_branches": unprotected_branches,
+                                "unsigned_commits": unsigned_commits,
+                                "readme_missing": readme_missing,
+                                "license_missing": license_missing,
+                                "pirr_missing": pirr_missing,
+                                "gitignore_missing": gitignore_missing,
+                                "external_pr": external_pr,
+                                "breaks_naming_convention": any(
+                                    c.isupper() for c in repo["name"]
+                                ),
+                                "secret_scanning_disabled": None,  # Will be set by worker
+                                "dependabot_disabled": not repo.get(
+                                    "hasVulnerabilityAlertsEnabled", False
+                                ),
+                                "codeowners_missing": codeowners_missing,
+                                "point_of_contact_missing": codeowners_missing,
+                            },
+                        }
 
-                    # Check branch protection
-                    unprotected_branches = False
-                    for branch in repo["refs"]["nodes"]:
-                        protection = branch.get("branchProtectionRule")
-                        if not protection or not all(
-                            [
-                                protection.get("requiresStatusChecks"),
-                                protection.get("requiresApprovingReviews"),
-                                protection.get("dismissesStaleReviews"),
-                            ]
-                        ):
-                            unprotected_branches = True
-                            break
+                        # Adjust checks based on visibility
+                        if repo_info["type"] == "public":
+                            repo_info["checklist"]["pirr_missing"] = False
+                        else:
+                            repo_info["checklist"]["license_missing"] = False
 
-                    # Check unsigned commits
-                    unsigned_commits = any(
-                        not commit.get("signature", {}).get("isValid")
-                        for commit in history_nodes
-                        if commit and commit.get("signature")
-                    )
+                        # Add to processing queue with timeout
+                        try:
+                            processing_queue.put(repo_info, timeout=5)
+                        except queue.Full:
+                            logger.error(
+                                f"Queue full, skipping repository {repo['name']}"
+                            )
+                            continue
 
-                    # Get all file paths for file checks
-                    files = []
-                    if repo.get("object") and repo["object"].get("entries"):
-                        files = [
-                            entry["path"].lower() for entry in repo["object"]["entries"]
-                        ]
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing repository {repo.get('name', 'unknown')}: {str(e)}"
+                        )
+                        continue  # Skip this repo but continue with others
 
-                    # File checks
-                    readme_missing = not any("readme.md" in f for f in files)
-                    license_missing = not any(
-                        f in ["license.md", "license"] for f in files
-                    )
-                    pirr_missing = not any("pirr.md" in f for f in files)
-                    gitignore_missing = not any(".gitignore" in f for f in files)
-                    codeowners_missing = not any(
-                        f in [".github/codeowners", "codeowners", "docs/codeowners"]
-                        for f in files
-                    )
-
-                    # Check for external PRs
-                    pr_authors = [
-                        pr["author"]["login"]
-                        for pr in repo["pullRequests"]["nodes"]
-                        if pr["author"]
-                    ]
-                    external_pr = any(
-                        author != "dependabot[bot]" for author in pr_authors
-                    )
-
-                    repo_info = {
-                        "name": repo["name"],
-                        "type": repo["visibility"].lower(),
-                        "url": repo["url"],
-                        "created_at": repo["createdAt"],
-                        "checklist": {
-                            "inactive": is_inactive,
-                            "unprotected_branches": unprotected_branches,
-                            "unsigned_commits": unsigned_commits,
-                            "readme_missing": readme_missing,
-                            "license_missing": license_missing,
-                            "pirr_missing": pirr_missing,
-                            "gitignore_missing": gitignore_missing,
-                            "external_pr": external_pr,
-                            "breaks_naming_convention": any(
-                                c.isupper() for c in repo["name"]
-                            ),
-                            "secret_scanning_disabled": None,  # Will be set by worker
-                            "dependabot_disabled": None,  # Will be set by worker
-                            "codeowners_missing": codeowners_missing,
-                            "point_of_contact_missing": codeowners_missing,
-                        },
-                    }
-
-                    # Adjust checks based on visibility
-                    if repo_info["type"] == "public":
-                        repo_info["checklist"]["pirr_missing"] = False
-                    else:
-                        repo_info["checklist"]["license_missing"] = False
-
-                    # Add to processing queue
-                    logger.debug(
-                        f"Queueing {repo['name']} for security processing (Queue size: {processing_queue.qsize()})"
-                    )
-                    processing_queue.put(repo_info)
-
-                except Exception as e:
-                    logger.error(
-                        f"Error processing repository {repo.get('name', 'unknown')}: {str(e)}"
-                    )
-
-            # Update pagination
-            has_next_page = data["data"]["organization"]["repositories"]["pageInfo"][
-                "hasNextPage"
-            ]
-            cursor = data["data"]["organization"]["repositories"]["pageInfo"][
-                "endCursor"
-            ]
+            except (KeyError, TypeError) as e:
+                logger.error(f"Error parsing GraphQL response: {str(e)}")
+                continue  # Skip this batch but continue with next cursor
 
             if repo_limit and TOTAL_RETRIEVED >= repo_limit:
                 break
 
-        # Add timeout check before worker cleanup
-        if check_timeout(start_time):
-            logger.warning("Timeout reached during processing")
-
+    except Exception as e:
+        logger.error(f"Fatal error in repository processing: {str(e)}")
     finally:
         cleanup_start = time.time()
         logger.info("Starting worker cleanup")
-        # Send poison pills to workers
-        logger.info("Sending shutdown signal to security workers")
-        for _ in range(THREAD_POOL_SIZE):
-            processing_queue.put(None)
 
-        # Wait for all security processing to complete
+        # Set a flag to stop processing
+        global should_stop_processing
+        should_stop_processing = True
+
+        # Clear the queue and send stop signals
+        try:
+            while not processing_queue.empty():
+                try:
+                    processing_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+            # Send poison pills to workers
+            logger.info("Sending shutdown signal to security workers")
+            for _ in range(THREAD_POOL_SIZE):
+                try:
+                    processing_queue.put(None, timeout=1)
+                except queue.Full:
+                    pass
+        except Exception as e:
+            logger.error(f"Error during queue cleanup: {str(e)}")
+
+        # Wait for workers with timeout
         logger.info("Waiting for security workers to complete...")
         for worker in workers:
-            worker.join()
-        logger.info("All security workers have completed")
+            worker.join(timeout=10)  # Give each thread 10 seconds to finish
+            if worker.is_alive():
+                logger.warning(f"Worker {worker.name} did not shut down cleanly")
+
+        logger.info("All security workers have completed or timed out")
         logger.info(f"Cleanup completed in {time.time() - cleanup_start:.2f} seconds")
 
     # Remove local file writing, just return the processed repos
@@ -420,6 +656,13 @@ def get_repository_data_graphql(
 def lambda_handler(event, context):
     """
     AWS Lambda handler function for GitHub repository audit
+
+    Args:
+        event: dict
+        context: dict
+
+    Returns:
+        dict: response
     """
     try:
         start_time = time.time()
@@ -457,8 +700,20 @@ def lambda_handler(event, context):
 
         # Upload to S3
         upload_start = time.time()
-        # Upload results to S3
         s3_client = session.client("s3")
+
+        # Extract alerts into separate lists
+        secret_scanning_alerts = []
+        dependabot_alerts = []
+        for repo in repos:
+            if "secret_scanning_alerts" in repo:
+                secret_scanning_alerts.extend(repo["secret_scanning_alerts"])
+                del repo["secret_scanning_alerts"]
+            if "dependabot_alerts" in repo:
+                dependabot_alerts.extend(repo["dependabot_alerts"])
+                del repo["dependabot_alerts"]
+
+        # Upload main repository data
         output_data = {
             "repositories": repos,
             "metadata": {
@@ -469,6 +724,7 @@ def lambda_handler(event, context):
         }
 
         try:
+            # Upload main repository data
             s3_client.put_object(
                 Bucket=BUCKET_NAME,
                 Key="repositories.json",
@@ -478,10 +734,32 @@ def lambda_handler(event, context):
             logger.info(
                 f"Successfully uploaded results to s3://{BUCKET_NAME}/repositories.json"
             )
+
+            # Upload secret scanning alerts
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key="secret_scanning.json",
+                Body=json.dumps(secret_scanning_alerts, indent=2, default=str),
+                ContentType="application/json",
+            )
+            logger.info(
+                f"Successfully uploaded secret scanning alerts to s3://{BUCKET_NAME}/secret_scanning.json"
+            )
+
+            # Upload dependabot alerts
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key="dependabot.json",
+                Body=json.dumps(dependabot_alerts, indent=2, default=str),
+                ContentType="application/json",
+            )
+            logger.info(
+                f"Successfully uploaded dependabot alerts to s3://{BUCKET_NAME}/dependabot.json"
+            )
+
         except Exception as e:
             logger.error(f"Failed to upload to S3: {str(e)}")
             raise
-        logger.info(f"S3 upload took {time.time() - upload_start:.2f} seconds")
 
         total_duration = time.time() - start_time
         logger.info(f"Total execution time: {total_duration:.2f} seconds")
