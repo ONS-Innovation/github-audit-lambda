@@ -231,13 +231,31 @@ def security_worker(gh: github_interface):
 def check_is_inactive(repo):
     # Calculate if repo is inactive
     try:
-        history_nodes = repo["defaultBranchRef"]["target"][
-            "history"
-        ]["nodes"]
+        if not repo.get("defaultBranchRef"):
+            # logger.warning(f"No default branch ref for repo {repo.get('name')}")
+            return False
+            
+        if not repo["defaultBranchRef"].get("target"):
+            # logger.warning(f"No target in default branch ref for repo {repo.get('name')}")
+            return False
+            
+        if not repo["defaultBranchRef"]["target"].get("history"):
+            # logger.warning(f"No history in target for repo {repo.get('name')}")
+            return False
+            
+        history_nodes = repo["defaultBranchRef"]["target"]["history"]["nodes"]
+        if not history_nodes:
+            # logger.warning(f"No history nodes for repo {repo.get('name')}, using pushedAt")
+            raise KeyError("No history nodes")
+            
         last_activity = datetime.datetime.strptime(
             history_nodes[0]["committedDate"], "%Y-%m-%dT%H:%M:%SZ"
         )
-    except (KeyError, IndexError, TypeError):
+    except (KeyError, IndexError, TypeError) as e:
+        logger.debug(f"Falling back to pushedAt for repo {repo.get('name')} due to: {str(e)}")
+        if not repo.get("pushedAt"):
+            # logger.warning(f"No pushedAt for repo {repo.get('name')}")
+            return False
         last_activity = datetime.datetime.strptime(
             repo["pushedAt"], "%Y-%m-%dT%H:%M:%SZ"
         )
@@ -250,46 +268,88 @@ def check_is_inactive(repo):
 
 def has_unprotected_branches(repo):
     # Check branch protection
-    unprotected_branches = False
-    for branch in repo["refs"]["nodes"]:
-        protection = branch.get("branchProtectionRule")
-        if not protection or not all(
-            [
-                protection.get("requiresStatusChecks"),
-                protection.get("requiresApprovingReviews"),
-                protection.get("dismissesStaleReviews"),
-            ]
-        ):
-            unprotected_branches = True
-            break
-    return unprotected_branches
+    try:
+        if not repo.get("refs") or not repo["refs"].get("nodes"):
+            # logger.warning(f"No refs/nodes for repo {repo.get('name')}")
+            return True
+            
+        unprotected_branches = False
+        for branch in repo["refs"]["nodes"]:
+            protection = branch.get("branchProtectionRule")
+            if not protection or not all(
+                [
+                    protection.get("requiresStatusChecks"),
+                    protection.get("requiresApprovingReviews"),
+                    protection.get("dismissesStaleReviews"),
+                ]
+            ):
+                unprotected_branches = True
+                break
+        return unprotected_branches
+    except Exception as e:
+        logger.error(f"Error checking branch protection for {repo.get('name')}: {str(e)}")
+        return True
 
 def check_unsigned_commits(repo):
     # Check unsigned commits
-    unsigned_commits = any(
-        not commit.get("signature", {}).get("isValid")
-        for commit in history_nodes
-        if commit and commit.get("signature")
-    )
-    return unsigned_commits
+    try:
+        if not repo.get("defaultBranchRef") or not repo["defaultBranchRef"].get("target") or \
+           not repo["defaultBranchRef"]["target"].get("history") or \
+           not repo["defaultBranchRef"]["target"]["history"].get("nodes"):
+            # logger.warning(f"Missing commit history structure for repo {repo.get('name')}")
+            return False
+            
+        unsigned_commits = any(
+            not commit.get("signature", {}).get("isValid")
+            for commit in repo["defaultBranchRef"]["target"]["history"]["nodes"]
+            if commit and commit.get("signature")
+        )
+        return unsigned_commits
+    except Exception as e:
+        logger.error(f"Error checking unsigned commits for {repo.get('name')}: {str(e)}")
+        return False
 
 def get_all_file_paths(repo):
     # Get all file paths for file checks
-    files = []
-    if repo.get("object") and repo["object"].get("entries"):
-        files = [entry["path"].lower() for entry in repo["object"]["entries"]]
-    return files
+    try:
+        if not repo.get("object"):
+            # logger.warning(f"No object data for repo {repo.get('name')}")
+            return []
+            
+        if not repo["object"].get("entries"):
+            # logger.warning(f"No entries in object for repo {repo.get('name')}")
+            return []
+            
+        return [entry["path"].lower() for entry in repo["object"]["entries"]]
+    except Exception as e:
+        logger.error(f"Error getting file paths for {repo.get('name')}: {str(e)}")
+        return []
 
 def check_dependabot_alerts(repo):
     # Process vulnerability alerts
     dependabot_alerts = []
-    if repo.get("vulnerabilityAlerts") and repo[
-        "vulnerabilityAlerts"
-    ].get("nodes"):
+    try:
+        if not repo.get("vulnerabilityAlerts"):
+            logger.debug(f"No vulnerability alerts object for repo {repo.get('name')}")
+            return dependabot_alerts
+            
+        if not repo["vulnerabilityAlerts"].get("nodes"):
+            logger.debug(f"No vulnerability alert nodes for repo {repo.get('name')}")
+            return dependabot_alerts
+            
         for alert in repo["vulnerabilityAlerts"]["nodes"]:
-            if not alert.get(
-                "dismissedAt"
-            ):  # Only include active alerts
+            try:
+                if not alert or alert.get("dismissedAt"):  # Skip dismissed alerts
+                    continue
+                    
+                if not alert.get("createdAt"):
+                    # logger.warning(f"Alert missing createdAt for repo {repo.get('name')}")
+                    continue
+                    
+                if not alert.get("securityVulnerability"):
+                    # logger.warning(f"Alert missing securityVulnerability for repo {repo.get('name')}")
+                    continue
+                    
                 created_at = datetime.datetime.strptime(
                     alert["createdAt"], "%Y-%m-%dT%H:%M:%SZ"
                 )
@@ -301,19 +361,19 @@ def check_dependabot_alerts(repo):
                     {
                         "repo": repo["name"],
                         "created_at": alert["createdAt"],
-                        "dependency": alert[
-                            "securityVulnerability"
-                        ]["package"]["name"],
-                        "advisory": alert["securityVulnerability"][
-                            "advisory"
-                        ]["description"],
-                        "severity": alert["securityVulnerability"][
-                            "severity"
-                        ].lower(),
+                        "dependency": alert["securityVulnerability"]["package"]["name"],
+                        "advisory": alert["securityVulnerability"]["advisory"]["description"],
+                        "severity": alert["securityVulnerability"]["severity"].lower(),
                         "days_open": days_open,
                         "link": f"https://github.com/{org}/{repo['name']}/security/dependabot/{len(dependabot_alerts) + 1}",
                     }
                 )
+            except Exception as e:
+                logger.error(f"Error processing individual alert for {repo.get('name')}: {str(e)}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"Error processing dependabot alerts for {repo.get('name')}: {str(e)}")
     return dependabot_alerts
 
 
@@ -523,7 +583,7 @@ def get_repository_data_graphql(
                     try:
                         is_inactive = check_is_inactive(repo)
 
-                        has_unprotected_branches = unprotected_branches(repo)
+                        unprotected_branches = has_unprotected_branches(repo)
 
                         unsigned_commits = check_unsigned_commits(repo)
 
@@ -536,7 +596,7 @@ def get_repository_data_graphql(
                         license_missing = check_missing_file(files, "license.md")
                         pirr_missing = check_missing_file(files, "pirr.md")
                         gitignore_missing = check_missing_file(files, ".gitignore")
-                        
+
                         codeowners_missing = not any(
                             f in [".github/codeowners", "codeowners", "docs/codeowners"]
                             for f in files
@@ -595,7 +655,7 @@ def get_repository_data_graphql(
 
                     except Exception as e:
                         logger.error(
-                            f"Error processing repository {repo.get('name', 'unknown')}: {str(e)}"
+                            f"{e.__class__.__name__}: Error processing repository {repo.get('name', 'unknown')}: {str(e)}"
                         )
                         continue  # Skip this repo but continue with others
 
@@ -781,3 +841,13 @@ def lambda_handler(event, context):
             "statusCode": 500,
             "body": json.dumps(f"Lambda execution failed: {str(e)}"),
         }
+
+
+if __name__ == "__main__":
+
+    # Simulate Lambda event and context
+    test_event = {}
+    test_context = None
+
+    # Call the handler
+    lambda_handler(test_event, test_context)
