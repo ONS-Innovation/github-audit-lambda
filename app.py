@@ -60,7 +60,6 @@ processing_queue = Queue()
 processed_repos = []
 processing_lock = threading.Lock()
 
-
 def get_repository_security_settings(gh: github_interface, repo_name: str) -> dict:
     """
     Get security settings for a repository using REST API.
@@ -215,7 +214,7 @@ def security_worker(gh: github_interface):
             with processing_lock:
                 queue_size = processing_queue.qsize()
                 TOTAL_PROCESSED = len(processed_repos)
-                if TOTAL_PROCESSED % 5 == 0 and queue_size != 0:
+                if TOTAL_PROCESSED % 10 == 0 and queue_size != 0:
                     logger.info(
                         f"Processed: {repos_processed} | "
                         f"Total processed: {TOTAL_PROCESSED} | "
@@ -449,7 +448,7 @@ def point_of_contact_exists(ql: github_graphql_interface, repo_name: str, org: s
         return True
 
 def get_repository_data_graphql(
-    ql: github_graphql_interface, gh: github_interface, org: str, batch_size: int = 25
+    ql: github_graphql_interface, gh: github_interface, org: str, batch_size: int = 25, org_members: set = set()
 ):
     """Gets repository data using concurrent processing
     
@@ -692,14 +691,7 @@ def get_repository_data_graphql(
                         codeowners_missing = check_codeowners_file(files, [".github/codeowners", "codeowners", "docs/codeowners"])
 
                         # Check for external PRs
-                        pr_authors = [
-                            pr["author"]["login"]
-                            for pr in repo["pullRequests"]["nodes"]
-                            if pr["author"]
-                        ]
-                        external_pr = any(
-                            author != "dependabot[bot]" for author in pr_authors
-                        )
+                        external_pr = check_external_pr(repo, org_members)
 
                         repo_info = {
                             "name": repo["name"],
@@ -798,6 +790,68 @@ def get_repository_data_graphql(
 
     return processed_repos
 
+def fetch_org_members(gh: github_interface, org: str):
+    """Fetch all organization members
+    
+    Args:
+        gh: github_interface
+        org: str
+    """
+    org_members = set()
+    logger.info("Starting to fetch organization members")
+    
+    try:
+        page = 1
+        while True:
+            response = gh.get(f"/orgs/{org}/members", params={"per_page": 100, "page": page})
+            if not response.ok:
+                logger.error(f"Failed to fetch org members page {page}: {response.status_code}")
+                break
+                
+            members = response.json()
+            if not members:  # No more members
+                break
+                
+            for member in members:
+                org_members.add(member["login"])
+            
+            # Check if there are more pages
+            if "next" not in response.links:
+                break
+                
+            page += 1
+            
+        logger.info(f"Fetched {len(org_members)} org members")
+        return org_members
+    except Exception as e:
+        logger.error(f"Error fetching org members: {str(e)}")
+        raise
+
+def check_external_pr(repo, org_members):
+    """Check if repository has external PRs
+    
+    Args:
+        repo: dict
+        org_members: set
+    Returns:
+        bool: True if has external PRs, False otherwise
+    """
+    try:
+        if not repo.get("pullRequests") or not repo["pullRequests"].get("nodes"):
+            return False
+            
+        for pr in repo["pullRequests"]["nodes"]:
+            if not pr.get("author"):
+                continue
+                
+            author = pr["author"]["login"]
+            if author != "dependabot[bot]" and author not in org_members:
+                return True
+                
+        return False
+    except Exception as e:
+        logger.error(f"Error checking external PRs for {repo.get('name')}: {str(e)}")
+        return False
 
 def lambda_handler(event, context):
     """
@@ -832,14 +886,15 @@ def lambda_handler(event, context):
         ql = github_graphql_interface(str(token[0]))
         gh = github_interface(str(token[0]))
 
-        # Get token
-        token_start = time.time()
-        # ... token getting code ...
-        logger.info(f"Token retrieval took {time.time() - token_start:.2f} seconds")
+        # Fetch org members first
+        org_members = fetch_org_members(gh, org)
+        if not org_members:
+            logger.error("Failed to fetch organization members")
+            return {"statusCode": 500, "body": json.dumps("Failed to fetch organization members")}
 
         # Get repos
         repo_start = time.time()
-        repos = get_repository_data_graphql(ql, gh, org)
+        repos = get_repository_data_graphql(ql, gh, org, 25, org_members)
         logger.info(
             f"Repository processing took {time.time() - repo_start:.2f} seconds"
         )
