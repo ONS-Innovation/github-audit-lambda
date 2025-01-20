@@ -41,6 +41,12 @@ secret_reigon = os.getenv("AWS_DEFAULT_REGION")
 account = os.getenv("AWS_ACCOUNT_NAME", "sdp-dev")
 BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME", "sdp-dev-github-audit")
 
+# Load config
+with open("config.json", "r") as f:
+    config = json.load(f)
+
+INACTIVITY_DAYS_AGO = config.get("inactivity_days_ago", 365)
+
 # Thread-safe queue for results
 result_queue = queue.Queue()
 
@@ -266,7 +272,7 @@ def check_is_inactive(repo):
 
     is_inactive = (
         datetime.datetime.now() - last_activity
-    ).days > 365
+    ).days > INACTIVITY_DAYS_AGO
 
     return is_inactive
 
