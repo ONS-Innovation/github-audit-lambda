@@ -104,19 +104,17 @@ def get_secret_scanning_alerts(gh: github_interface, repo_name: str) -> list:
     """
     alerts = []
     try:
-        response = gh.get(f"/repos/{org}/{repo_name}/secret-scanning/alerts")
+        response = gh.get(f"/repos/{org}/{repo_name}/secret-scanning/alerts", params={"state": "open"})
         if response.ok:
             for alert in response.json():
                 alerts.append(
                     {
                         "repo": repo_name,
                         "created_at": alert["created_at"],
-                        "secret": alert["secret_type_display_name"],
                         "link": alert["html_url"],
                     }
                 )
         elif response.status_code == 404:
-            # Repository doesn't have secret scanning enabled or is public
             logger.debug(f"Secret scanning not available for {repo_name}")
     except AttributeError:
         # Non-fatal error, so we can continue
@@ -140,7 +138,7 @@ def get_dependabot_alerts(gh: github_interface, repo_name: str) -> list:
     """
     alerts = []
     try:
-        response = gh.get(f"/repos/{org}/{repo_name}/dependabot/alerts")
+        response = gh.get(f"/repos/{org}/{repo_name}/dependabot/alerts", params={"state": "open"})
         if response.ok:
             for alert in response.json():
                 alerts.append(
@@ -148,8 +146,6 @@ def get_dependabot_alerts(gh: github_interface, repo_name: str) -> list:
                         "repo": repo_name,
                         "created_at": alert["created_at"],
                         "severity": alert["security_advisory"]["severity"],
-                        "package": alert["security_advisory"]["package"]["name"],
-                        "description": alert["security_advisory"]["description"],
                         "link": alert["html_url"],
                     }
                 )
@@ -229,6 +225,14 @@ def security_worker(gh: github_interface):
             continue
 
 def check_is_inactive(repo):
+    """Check if a repository is inactive
+    
+    Args:
+        repo: dict
+    
+    Returns:
+        bool: True if inactive, False otherwise
+    """
     # Calculate if repo is inactive
     try:
         if not repo.get("defaultBranchRef"):
@@ -267,7 +271,14 @@ def check_is_inactive(repo):
     return is_inactive
 
 def has_unprotected_branches(repo):
-    # Check branch protection
+    """Check if a repository has unprotected branches
+    
+    Args:
+        repo: dict
+    
+    Returns:
+        bool: True if unprotected branches, False otherwise
+    """
     try:
         if not repo.get("refs") or not repo["refs"].get("nodes"):
             # logger.warning(f"No refs/nodes for repo {repo.get('name')}")
@@ -291,7 +302,14 @@ def has_unprotected_branches(repo):
         return True
 
 def check_unsigned_commits(repo):
-    # Check unsigned commits
+    """Check if a repository has unsigned commits
+    
+    Args:
+        repo: dict
+    
+    Returns:
+        bool: True if unsigned commits, False otherwise
+    """
     try:
         if not repo.get("defaultBranchRef") or not repo["defaultBranchRef"].get("target") or \
            not repo["defaultBranchRef"]["target"].get("history") or \
@@ -310,7 +328,14 @@ def check_unsigned_commits(repo):
         return False
 
 def get_all_file_paths(repo):
-    # Get all file paths for file checks
+    """Get all file paths for file checks
+    
+    Args:
+        repo: dict
+    
+    Returns:
+        list: file paths
+    """
     try:
         if not repo.get("object"):
             # logger.warning(f"No object data for repo {repo.get('name')}")
@@ -326,7 +351,14 @@ def get_all_file_paths(repo):
         return []
 
 def check_dependabot_alerts(repo):
-    # Process vulnerability alerts
+    """Process vulnerability alerts
+    
+    Args:
+        repo: dict
+    
+    Returns:
+        list: dependabot alerts
+    """
     dependabot_alerts = []
     try:
         if not repo.get("vulnerabilityAlerts"):
@@ -378,7 +410,15 @@ def check_dependabot_alerts(repo):
 
 
 def check_missing_file(files, file_name):
-    # Check for missing file
+    """Check for missing file
+    
+    Args:
+        files: list
+        file_name: str
+    
+    Returns:
+        bool: True if missing, False otherwise
+    """
     return not any(file_name in f for f in files)
 
 def get_repository_data_graphql(
@@ -671,10 +711,6 @@ def get_repository_data_graphql(
     finally:
         cleanup_start = time.time()
         logger.info("Starting worker cleanup")
-
-        # Set a flag to stop processing
-        global should_stop_processing
-        should_stop_processing = True
 
         # Clear the queue and send stop signals
         try:
