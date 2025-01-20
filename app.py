@@ -492,10 +492,9 @@ def get_repository_data_graphql(
             isArchived
             hasVulnerabilityAlertsEnabled
             
-            vulnerabilityAlerts(first: 100) {
+            vulnerabilityAlerts(first: 100, states: OPEN) {
               nodes {
                 createdAt
-                dismissedAt
                 securityVulnerability {
                   severity
                   package {
@@ -656,7 +655,30 @@ def get_repository_data_graphql(
 
                         files = get_all_file_paths(repo)
 
-                        dependabot_alerts = check_dependabot_alerts(repo)
+                        # Process vulnerability alerts
+                        dependabot_alerts = []
+                        if repo.get("vulnerabilityAlerts") and repo["vulnerabilityAlerts"].get("nodes"):
+                            for alert in repo["vulnerabilityAlerts"]["nodes"]:
+                                try:
+                                    created_at = datetime.datetime.strptime(
+                                        alert["createdAt"], "%Y-%m-%dT%H:%M:%SZ"
+                                    )
+                                    days_open = (
+                                        datetime.datetime.now() - created_at
+                                    ).days
+
+                                    dependabot_alerts.append({
+                                        "repo": repo["name"],
+                                        "created_at": alert["createdAt"],
+                                        "dependency": alert["securityVulnerability"]["package"]["name"],
+                                        "advisory": alert["securityVulnerability"]["advisory"]["description"],
+                                        "severity": alert["securityVulnerability"]["severity"].lower(),
+                                        "days_open": days_open,
+                                        "link": f"https://github.com/{org}/{repo['name']}/security/dependabot/{len(dependabot_alerts) + 1}"
+                                    })
+                                except Exception as e:
+                                    logger.error(f"Error processing individual alert for {repo.get('name')}: {str(e)}")
+                                    continue
 
                         # File checks
                         readme_missing = check_missing_file(files, "readme.md")
@@ -837,14 +859,13 @@ def lambda_handler(event, context):
                 dependabot_alerts.extend(repo["dependabot_alerts"])
                 del repo["dependabot_alerts"]
 
-        # Upload main repository data
-        output_data = {
-            "repositories": repos,
-            "metadata": {
-                "timestamp": datetime.datetime.now().isoformat(),
-                "repository_count": len(repos),
-                "organization": org,
-            },
+        # Upload metadata
+        metadata = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "repository_count": len(repos),
+            "organization": org,
+            "runtime": round(time.time() - start_time, 3),
+            "inactivity_days_ago": INACTIVITY_DAYS_AGO,
         }
 
         try:
@@ -852,7 +873,7 @@ def lambda_handler(event, context):
             s3_client.put_object(
                 Bucket=BUCKET_NAME,
                 Key="repositories.json",
-                Body=json.dumps(output_data, indent=2, default=str),
+                Body=json.dumps(repos, indent=2, default=str),
                 ContentType="application/json",
             )
             logger.info(
@@ -879,6 +900,17 @@ def lambda_handler(event, context):
             )
             logger.info(
                 f"Successfully uploaded dependabot alerts to s3://{BUCKET_NAME}/dependabot.json"
+            )
+
+            # Upload metadata
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key="metadata.json",
+                Body=json.dumps(metadata, indent=2, default=str),
+                ContentType="application/json",
+            )
+            logger.info(
+                f"Successfully uploaded metadata to s3://{BUCKET_NAME}/metadata.json"
             )
 
         except Exception as e:
