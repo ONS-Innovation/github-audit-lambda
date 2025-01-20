@@ -421,6 +421,45 @@ def check_missing_file(files, file_name):
     """
     return not any(file_name in f for f in files)
 
+def check_codeowners_file(files, file_list):
+    """Check for codeowners file
+    
+    Args:
+        files: list
+        file_name: str
+    
+    Returns:
+        bool: True if missing, False otherwise
+    """
+    return not any(f in file_list for f in files)
+
+def point_of_contact_exists(ql: github_graphql_interface, repo_name: str, org: str, codeowners_missing: bool) -> bool:
+    """Checks if a point of contact is defined for a given repository.
+
+    Args:
+        ql (github_graphql_interface): An instance of the github_graphql_interface class to make calls to the GitHub GraphQL API.
+        repo_name (str): The name of the repository to check.
+        org (str): The name of the organisation.
+        codeowners_missing (bool): True if a CODEOWNERS file doesn't exist in the repository.
+
+    Returns:
+        bool: True if point of contact is missing (breaks policy), False if defined.
+    """
+
+    # If CODEOWNERS file is missing, then point of contact is missing
+    # Therefore we don't need to call the GraphQL API
+    # Saving run time and resources
+    if codeowners_missing:
+        return True
+
+    main_branch = ql.get_repository_email_list(org, repo_name, branch="main")
+    master_branch = ql.get_repository_email_list(org, repo_name, branch="master")
+
+    if main_branch or master_branch:
+        return False
+    else:
+        return True
+
 def get_repository_data_graphql(
     ql: github_graphql_interface, gh: github_interface, org: str, batch_size: int = 25
 ):
@@ -633,14 +672,15 @@ def get_repository_data_graphql(
 
                         # File checks
                         readme_missing = check_missing_file(files, "readme.md")
+
                         license_missing = check_missing_file(files, "license.md")
+
                         pirr_missing = check_missing_file(files, "pirr.md")
+
                         gitignore_missing = check_missing_file(files, ".gitignore")
 
-                        codeowners_missing = not any(
-                            f in [".github/codeowners", "codeowners", "docs/codeowners"]
-                            for f in files
-                        )
+                        codeowners_missing = check_codeowners_file(files, [".github/codeowners", "codeowners", "docs/codeowners"])
+
                         # Check for external PRs
                         pr_authors = [
                             pr["author"]["login"]
@@ -674,7 +714,7 @@ def get_repository_data_graphql(
                                     "hasVulnerabilityAlertsEnabled", False
                                 ),
                                 "codeowners_missing": codeowners_missing,
-                                "point_of_contact_missing": codeowners_missing,
+                                "point_of_contact_missing": point_of_contact_exists(ql, repo["name"], org, codeowners_missing),
                             },
                         }
 
