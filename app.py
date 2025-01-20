@@ -231,7 +231,7 @@ def security_worker(gh: github_interface):
             continue
 
 def check_is_inactive(repo):
-    """Check if a repository is inactive
+    """Check if a repository is inactive based on pushedAt date
     
     Args:
         repo: dict
@@ -239,42 +239,24 @@ def check_is_inactive(repo):
     Returns:
         bool: True if inactive, False otherwise
     """
-    # Calculate if repo is inactive
     try:
-        if not repo.get("defaultBranchRef"):
-            # logger.warning(f"No default branch ref for repo {repo.get('name')}")
-            return False
-            
-        if not repo["defaultBranchRef"].get("target"):
-            # logger.warning(f"No target in default branch ref for repo {repo.get('name')}")
-            return False
-            
-        if not repo["defaultBranchRef"]["target"].get("history"):
-            # logger.warning(f"No history in target for repo {repo.get('name')}")
-            return False
-            
-        history_nodes = repo["defaultBranchRef"]["target"]["history"]["nodes"]
-        if not history_nodes:
-            # logger.warning(f"No history nodes for repo {repo.get('name')}, using pushedAt")
-            raise KeyError("No history nodes")
-            
-        last_activity = datetime.datetime.strptime(
-            history_nodes[0]["committedDate"], "%Y-%m-%dT%H:%M:%SZ"
-        )
-    except (KeyError, IndexError, TypeError) as e:
-        logger.debug(f"Falling back to pushedAt for repo {repo.get('name')} due to: {str(e)}")
         if not repo.get("pushedAt"):
-            # logger.warning(f"No pushedAt for repo {repo.get('name')}")
+            logger.warning(f"No pushedAt for repo {repo.get('name')}")
             return False
+            
         last_activity = datetime.datetime.strptime(
             repo["pushedAt"], "%Y-%m-%dT%H:%M:%SZ"
         )
+        
+        is_inactive = (
+            datetime.datetime.now() - last_activity
+        ).days > INACTIVITY_DAYS_AGO
 
-    is_inactive = (
-        datetime.datetime.now() - last_activity
-    ).days > INACTIVITY_DAYS_AGO
-
-    return is_inactive
+        return is_inactive
+        
+    except Exception as e:
+        logger.error(f"Error checking inactivity for {repo.get('name')}: {str(e)}")
+        return False
 
 def has_unprotected_branches(repo):
     """Check if a repository has unprotected branches
