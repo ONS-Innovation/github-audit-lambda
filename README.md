@@ -1,3 +1,9 @@
+## Archived
+
+**Important**: This repository was a baseline to increase GitHub scraping speeds for the policy dashboard using GraphQL and RESTful API requests together. Since this baseline, a new version has been created.
+
+-----
+
 # GitHub Audit Lambda 
 
 This repository contains the investigation of the rewrite for the GitHub Audit Lambda function. This aims to improve speed and efficiency so all repositories in the organization can be audited within 15 minutes (Lambda runtime limit).
