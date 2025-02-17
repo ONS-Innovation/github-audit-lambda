@@ -14,6 +14,8 @@ import github_api_toolkit
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 20))
+
 # Set up logging for Lambda environment
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -30,20 +32,21 @@ stdout_handler.setFormatter(
 logger.addHandler(stdout_handler)
 
 # Configuration
-org = os.getenv("GITHUB_ORG")
+org = os.getenv("GITHUB_ORG", "onsdigital")
 client_id = os.getenv("GITHUB_APP_CLIENT_ID")
 repo_limit = int(os.getenv("REPO_LIMIT", "0"))  # 0 means no limit
 
 # AWS Secret Manager Secret Name for the .pem file
-secret_name = os.getenv("AWS_SECRET_NAME")
-secret_reigon = os.getenv("AWS_DEFAULT_REGION")
+secret_name = os.getenv("AWS_SECRET_NAME", "/sdp-dev/github-tooling-suite/onsdigital")
+secret_reigon = os.getenv("AWS_DEFAULT_REGION", "eu-west-2")
 
 account = os.getenv("AWS_ACCOUNT_NAME", "sdp-dev")
 BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME", "sdp-dev-github-audit")
 
 # Load config
-with open("config.json", "r") as f:
-    config = json.load(f)
+config = {
+    "inactivity_days_ago": 365
+}
 
 INACTIVITY_DAYS_AGO = config.get("inactivity_days_ago", 365)
 
@@ -448,7 +451,7 @@ def point_of_contact_exists(ql: github_graphql_interface, repo_name: str, org: s
         return True
 
 def get_repository_data_graphql(
-    ql: github_graphql_interface, gh: github_interface, org: str, batch_size: int = 25, org_members: set = set()
+    ql: github_graphql_interface, gh: github_interface, org: str, batch_size: int = BATCH_SIZE, org_members: set = set()
 ):
     """Gets repository data using concurrent processing
     
@@ -463,15 +466,6 @@ def get_repository_data_graphql(
     """
     start_time = time.time()
     logger.info(f"Starting repository data collection for {org}")
-
-    # Add timeout check
-    def check_timeout(
-        start_time, max_duration=840
-    ):  # 14 minutes, leaving 1 minute buffer
-        if time.time() - start_time > max_duration:
-            logger.warning("Approaching Lambda timeout, stopping processing")
-            return True
-        return False
 
     # Define GraphQL query at the start of the function
     query = """
@@ -506,7 +500,6 @@ def get_repository_data_graphql(
               }
             }
             
-            # For inactive check and unsigned commits
             defaultBranchRef {
               target {
                 ... on Commit {
@@ -522,7 +515,6 @@ def get_repository_data_graphql(
               }
             }
             
-            # For branch protection check
             refs(refPrefix: "refs/heads/", first: 100) {
               nodes {
                 name
@@ -535,7 +527,6 @@ def get_repository_data_graphql(
               }
             }
             
-            # For file checks (README, LICENSE, etc)
             object(expression: "HEAD:") {
               ... on Tree {
                 entries {
@@ -545,7 +536,6 @@ def get_repository_data_graphql(
               }
             }
             
-            # For external PR check
             pullRequests(first: 100, states: OPEN) {
               nodes {
                 author {
@@ -566,7 +556,7 @@ def get_repository_data_graphql(
         worker = threading.Thread(
             target=security_worker, args=(gh,), name=f"thread-{i+1}"
         )
-        worker.daemon = True  # Make threads daemon so they don't block shutdown
+        worker.daemon = True
         worker.start()
         workers.append(worker)
 
@@ -576,20 +566,15 @@ def get_repository_data_graphql(
 
     try:
         while has_next_page:
-            if check_timeout(start_time):
-                break
-
-            variables = {"org": org, "limit": batch_size, "cursor": cursor}
+            variables = {"org": org, "limit": BATCH_SIZE, "cursor": cursor}
 
             # Get GraphQL data with retries and exponential backoff
-            for attempt in range(5):  # Increased retry attempts
+            for attempt in range(5):
                 try:
                     result = ql.make_ql_request(query, variables)
                     if not result.ok:
-                        if result.status_code in [403, 429]:  # Rate limit exceeded
-                            wait_time = min(
-                                2**attempt, 32
-                            )  # Exponential backoff capped at 32 seconds
+                        if result.status_code in [403, 429]:
+                            wait_time = min(2**attempt, 32)
                             logger.warning(
                                 f"Rate limit hit on attempt {attempt+1}. "
                                 f"Waiting {wait_time} seconds before retrying."
@@ -607,7 +592,7 @@ def get_repository_data_graphql(
                         logger.error(
                             f"GraphQL query failed on attempt {attempt+1}: {data['errors']}"
                         )
-                        if attempt < 4:  # Allow for one more retry
+                        if attempt < 4:
                             time.sleep(1)
                             continue
                     break
@@ -615,7 +600,7 @@ def get_repository_data_graphql(
                     requests.exceptions.RequestException,
                     requests.exceptions.ConnectionError,
                 ) as e:
-                    if attempt == 4:  # Last attempt
+                    if attempt == 4:
                         logger.error(f"Failed all retry attempts: {str(e)}")
                         raise
                     wait_time = min(2**attempt, 32)
@@ -625,7 +610,7 @@ def get_repository_data_graphql(
                     time.sleep(wait_time)
             else:
                 logger.error("All attempts to execute GraphQL query failed.")
-                continue  # Skip this batch but continue with next cursor
+                continue
 
             # Process the successful response
             try:
@@ -635,7 +620,7 @@ def get_repository_data_graphql(
                     f"Retrieved: {len(repos)} | Total repositories: {TOTAL_RETRIEVED}"
                 )
 
-                # Update pagination before processing
+                # Update pagination
                 has_next_page = data["data"]["organization"]["repositories"][
                     "pageInfo"
                 ]["hasNextPage"]
@@ -762,7 +747,6 @@ def get_repository_data_graphql(
                 except queue.Empty:
                     break
 
-            # Send poison pills to workers
             logger.info("Sending shutdown signal to security workers")
             for _ in range(THREAD_POOL_SIZE):
                 try:
@@ -772,17 +756,15 @@ def get_repository_data_graphql(
         except Exception as e:
             logger.error(f"Error during queue cleanup: {str(e)}")
 
-        # Wait for workers with timeout
         logger.info("Waiting for security workers to complete...")
         for worker in workers:
-            worker.join(timeout=10)  # Give each thread 10 seconds to finish
+            worker.join(timeout=10)
             if worker.is_alive():
                 logger.warning(f"Worker {worker.name} did not shut down cleanly")
 
         logger.info("All security workers have completed or timed out")
         logger.info(f"Cleanup completed in {time.time() - cleanup_start:.2f} seconds")
 
-    # Remove local file writing, just return the processed repos
     duration = time.time() - start_time
     logger.info(
         f"Total processing time: {duration:.2f} seconds ({duration/60:.2f} minutes)"
@@ -853,7 +835,7 @@ def check_external_pr(repo, org_members):
         logger.error(f"Error checking external PRs for {repo.get('name')}: {str(e)}")
         return False
 
-def lambda_handler(event, context):
+def main():
     """
     AWS Lambda handler function for GitHub repository audit
 
@@ -875,12 +857,19 @@ def lambda_handler(event, context):
         secret_manager = session.client("secretsmanager", region_name=secret_reigon)
 
         logger.info("Getting GitHub token from AWS Secrets Manager")
-        secret = secret_manager.get_secret_value(SecretId=secret_name)["SecretString"]
+        try:
+            secret = secret_manager.get_secret_value(SecretId=secret_name)["SecretString"]
+        except Exception as e:
+            logger.error(f"Failed to get secret from Secrets Manager: {str(e)}")
+            raise
 
-        token = github_api_toolkit.get_token_as_installation(org, secret, client_id)
-        if not token:
-            logger.error("Error getting GitHub token")
-            return {"statusCode": 500, "body": json.dumps("Failed to get GitHub token")}
+        try:
+            token = github_api_toolkit.get_token_as_installation(org, secret, client_id)
+            if not token:
+                raise Exception("Empty token returned")
+        except Exception as e:
+            logger.error(f"Failed to get GitHub token: {str(e)}")
+            raise
 
         logger.info("Successfully obtained GitHub token")
         ql = github_graphql_interface(str(token[0]))
@@ -894,7 +883,7 @@ def lambda_handler(event, context):
 
         # Get repos
         repo_start = time.time()
-        repos = get_repository_data_graphql(ql, gh, org, 25, org_members)
+        repos = get_repository_data_graphql(ql, gh, org, 30, org_members)
         logger.info(
             f"Repository processing took {time.time() - repo_start:.2f} seconds"
         )
@@ -995,10 +984,4 @@ def lambda_handler(event, context):
 
 
 if __name__ == "__main__":
-
-    # Simulate Lambda event and context
-    test_event = {}
-    test_context = None
-
-    # Call the handler
-    lambda_handler(test_event, test_context)
+    main()
